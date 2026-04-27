@@ -96,6 +96,8 @@ export const handler = withAuth(async (event, ctx) => {
       { $setOnInsert: { userId, teamId, joinedAt: now } },
       { upsert: true }
     );
+    // One role per (user, team): clear any other roles before assigning this one.
+    await utr.deleteMany({ userId, teamId, roleId: { $ne: roleId } });
     await utr.updateOne(
       { userId, teamId, roleId },
       {

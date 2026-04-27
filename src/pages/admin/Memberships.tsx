@@ -23,8 +23,10 @@ export default function AdminMemberships() {
   const [members, setMembers] = useState<Member[]>([]);
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [roles, setRoles] = useState<Role[]>([]);
-  const [picker, setPicker] = useState<User | null>(null);
+  const [addPicker, setAddPicker] = useState<User | null>(null);
+  const [rolePicker, setRolePicker] = useState<User | null>(null);
   const [pickerRole, setPickerRole] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     api.get<Page<Role>>("/roles").then((d) => setRoles(d.items));
@@ -42,9 +44,13 @@ export default function AdminMemberships() {
     ]);
     setMembers(m.items);
     setAssignments(a.items);
+    setRefreshKey((k) => k + 1);
   };
 
   useEffect(() => {
+    setAddPicker(null);
+    setRolePicker(null);
+    setPickerRole("");
     reload().catch((e: Error) => toast.error(e.message));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [teamId]);
@@ -54,6 +60,7 @@ export default function AdminMemberships() {
     try {
       await api.post("/memberships", { userId: u.id, teamId });
       toast.success(`Added ${u.name}`);
+      setAddPicker(null);
       await reload();
     } catch (e) {
       toast.error((e as Error).message);
@@ -65,6 +72,7 @@ export default function AdminMemberships() {
     try {
       await api.del(`/memberships/${teamId}/${userId}`);
       toast.success("Removed");
+      if (rolePicker?.id === userId) setRolePicker(null);
       await reload();
     } catch (e) {
       toast.error((e as Error).message);
@@ -72,11 +80,11 @@ export default function AdminMemberships() {
   };
 
   const assignRole = async () => {
-    if (!teamId || !picker || !pickerRole) return;
+    if (!teamId || !rolePicker || !pickerRole) return;
     try {
-      await api.post("/assignments", { userId: picker.id, teamId, roleId: pickerRole });
-      toast.success("Role assigned");
-      setPicker(null);
+      await api.post("/assignments", { userId: rolePicker.id, teamId, roleId: pickerRole });
+      toast.success("Role updated");
+      setRolePicker(null);
       setPickerRole("");
       await reload();
     } catch (e) {
@@ -102,8 +110,9 @@ export default function AdminMemberships() {
         <CardHeader>
           <CardTitle>Memberships & Role Assignments</CardTitle>
           <CardDescription>
-            Pick a team, then add members and assign each one a role within this team. A user can hold
-            multiple roles per team. Click a role chip on a member to remove that assignment.
+            Pick a team, then add members and assign each one a role within this team. Each member
+            holds exactly one role per team — assigning a new role replaces the previous one. Click
+            a member's role chip to remove it.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -122,10 +131,10 @@ export default function AdminMemberships() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              <UserPicker value={picker?.id ?? null} onChange={setPicker} />
+              <UserPicker value={addPicker?.id ?? null} onChange={setAddPicker} />
               <Button
-                disabled={!picker}
-                onClick={() => picker && addMember(picker)}
+                disabled={!addPicker}
+                onClick={() => addPicker && addMember(addPicker)}
                 className="w-full"
               >
                 <Plus className="mr-1 h-4 w-4" /> Add to team
@@ -135,11 +144,19 @@ export default function AdminMemberships() {
 
           <Card>
             <CardHeader>
-              <CardTitle>Assign a role</CardTitle>
-              <CardDescription>The user must already be a member of this team.</CardDescription>
+              <CardTitle>Set member's role</CardTitle>
+              <CardDescription>
+                The user must already be a member of this team. Assigning replaces any existing
+                role.
+              </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
-              <UserPicker value={picker?.id ?? null} onChange={setPicker} teamId={teamId} />
+              <UserPicker
+                key={`role-picker-${teamId}-${refreshKey}`}
+                value={rolePicker?.id ?? null}
+                onChange={setRolePicker}
+                teamId={teamId}
+              />
               <Select value={pickerRole} onChange={(e) => setPickerRole(e.target.value)}>
                 <option value="">— Select role —</option>
                 {roles.map((r) => (
@@ -148,8 +165,8 @@ export default function AdminMemberships() {
                   </option>
                 ))}
               </Select>
-              <Button onClick={assignRole} disabled={!picker || !pickerRole} className="w-full">
-                Assign role
+              <Button onClick={assignRole} disabled={!rolePicker || !pickerRole} className="w-full">
+                Set role
               </Button>
             </CardContent>
           </Card>
@@ -164,30 +181,27 @@ export default function AdminMemberships() {
               ) : (
                 <ul className="divide-y">
                   {members.map((m) => {
-                    const userRoles = rolesForUser(m.user_id);
+                    const userRole = rolesForUser(m.user_id)[0];
                     return (
                       <li key={m.user_id} className="flex items-start justify-between py-3">
                         <div>
                           <div className="font-medium">{m.profiles.name}</div>
                           <div className="text-xs text-muted-foreground">{m.profiles.email}</div>
                           <div className="mt-1 flex flex-wrap gap-1">
-                            {userRoles.length === 0 ? (
+                            {!userRole ? (
                               <Badge variant="outline">no role</Badge>
                             ) : (
-                              userRoles.map((a) => (
-                                <button
-                                  key={a.role_id}
-                                  onClick={() => removeAssignment(a)}
-                                  className={cn(
-                                    "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium transition-colors hover:bg-destructive hover:text-destructive-foreground",
-                                    roleClasses(a.roles.name)
-                                  )}
-                                  title="Click to remove this role assignment"
-                                >
-                                  {a.roles.name}
-                                  <span aria-hidden>×</span>
-                                </button>
-                              ))
+                              <button
+                                onClick={() => removeAssignment(userRole)}
+                                className={cn(
+                                  "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium transition-colors hover:bg-destructive hover:text-destructive-foreground",
+                                  roleClasses(userRole.roles.name)
+                                )}
+                                title="Click to remove this role"
+                              >
+                                {userRole.roles.name}
+                                <span aria-hidden>×</span>
+                              </button>
                             )}
                           </div>
                         </div>

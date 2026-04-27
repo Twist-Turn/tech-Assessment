@@ -2,7 +2,6 @@ import { ObjectId } from "mongodb";
 import { withAuth } from "./_lib/handler.js";
 import { json, error, parseJson } from "./_lib/http.js";
 import { collections, getDb } from "./_lib/db.js";
-import { serialize } from "./_lib/serialize.js";
 import { writeAudit } from "./_lib/audit.js";
 
 interface CreateTeamBody {
@@ -29,10 +28,19 @@ export const handler = withAuth(async (event, ctx) => {
 
     const docs = await teams.find(filter).sort({ createdAt: -1 }).limit(limit + 1).toArray();
     const hasMore = docs.length > limit;
-    const items = (hasMore ? docs.slice(0, limit) : docs).map((t) => serialize(t));
+    const slice = hasMore ? docs.slice(0, limit) : docs;
+    const items = slice.map((t: any) => ({
+      id: t._id.toString(),
+      name: t.name,
+      created_at: t.createdAt instanceof Date ? t.createdAt.toISOString() : t.createdAt,
+      created_by: t.createdBy ? t.createdBy.toString() : null,
+    }));
+    const lastDoc = slice[slice.length - 1] as any;
     return json({
       items,
-      nextCursor: hasMore ? (items[items.length - 1] as any).createdAt : null,
+      nextCursor: hasMore && lastDoc?.createdAt
+        ? (lastDoc.createdAt instanceof Date ? lastDoc.createdAt.toISOString() : lastDoc.createdAt)
+        : null,
     });
   }
 
@@ -99,8 +107,8 @@ export const handler = withAuth(async (event, ctx) => {
       {
         id: teamId.toString(),
         name: body.name.trim(),
-        createdBy: ctx.userId,
-        createdAt: now.toISOString(),
+        created_by: ctx.userId,
+        created_at: now.toISOString(),
       },
       201
     );

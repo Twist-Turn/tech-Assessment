@@ -35,8 +35,8 @@ export const handler = withAuth(async (event, ctx) => {
           {
             $project: {
               _id: 0,
-              userId: { $toString: "$userId" },
-              joinedAt: "$joinedAt",
+              user_id: { $toString: "$userId" },
+              joined_at: "$joinedAt",
               profiles: {
                 id: { $toString: "$user._id" },
                 name: "$user.name",
@@ -64,8 +64,8 @@ export const handler = withAuth(async (event, ctx) => {
         {
           $project: {
             _id: 0,
-            teamId: { $toString: "$teamId" },
-            joinedAt: "$joinedAt",
+            team_id: { $toString: "$teamId" },
+            joined_at: "$joinedAt",
             teams: {
               id: { $toString: "$team._id" },
               name: "$team.name",

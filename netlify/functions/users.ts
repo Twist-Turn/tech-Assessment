@@ -2,7 +2,6 @@ import bcrypt from "bcryptjs";
 import { withAuth } from "./_lib/handler.js";
 import { json, error, parseJson } from "./_lib/http.js";
 import { collections, getDb } from "./_lib/db.js";
-import { serialize } from "./_lib/serialize.js";
 import { writeAudit } from "./_lib/audit.js";
 
 interface CreateUserBody {
@@ -38,12 +37,19 @@ export const handler = withAuth(async (event, ctx) => {
       .limit(limit + 1)
       .toArray();
     const hasMore = docs.length > limit;
-    const items = (hasMore ? docs.slice(0, limit) : docs).map((u) =>
-      serialize<{ id: string; name: string; email: string; createdAt: string }>(u)
-    );
+    const slice = hasMore ? docs.slice(0, limit) : docs;
+    const items = slice.map((u: any) => ({
+      id: u._id.toString(),
+      name: u.name,
+      email: u.email,
+      created_at: u.createdAt instanceof Date ? u.createdAt.toISOString() : u.createdAt,
+    }));
+    const lastDoc = slice[slice.length - 1] as any;
     return json({
       items,
-      nextCursor: hasMore ? (items[items.length - 1] as any).createdAt : null,
+      nextCursor: hasMore && lastDoc?.createdAt
+        ? (lastDoc.createdAt instanceof Date ? lastDoc.createdAt.toISOString() : lastDoc.createdAt)
+        : null,
     });
   }
 
@@ -73,7 +79,7 @@ export const handler = withAuth(async (event, ctx) => {
           id: result.insertedId.toString(),
           name: body.name,
           email: body.email,
-          createdAt: now.toISOString(),
+          created_at: now.toISOString(),
         },
         201
       );
