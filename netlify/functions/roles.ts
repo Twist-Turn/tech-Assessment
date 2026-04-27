@@ -1,6 +1,8 @@
+import { ObjectId } from "mongodb";
 import { withAuth } from "./_lib/handler.js";
 import { json, error, parseJson, pathSegments } from "./_lib/http.js";
-import { getServiceClient } from "./_lib/supabase.js";
+import { collections, getDb } from "./_lib/db.js";
+import { tryOid } from "./_lib/serialize.js";
 import { writeAudit } from "./_lib/audit.js";
 
 interface CreateRoleBody {
@@ -15,25 +17,50 @@ interface AssignPermsBody {
   replace?: boolean;
 }
 
+function toOidArray(ids?: string[]): ObjectId[] {
+  if (!ids) return [];
+  return ids.map((s) => tryOid(s)).filter(Boolean) as ObjectId[];
+}
+
 export const handler = withAuth(async (event, ctx) => {
-  const sb = getServiceClient();
+  const db = await getDb();
+  const roles = db.collection(collections.roles);
   const seg = pathSegments(event, "roles");
 
   // GET /roles → list roles with their permissions
   if (event.httpMethod === "GET" && seg.length === 0) {
-    const { data, error: e } = await sb
-      .from("roles")
-      .select("id, name, description, role_permissions ( permissions ( id, key ) )")
-      .order("name");
-    if (e) return error(e.message, 500);
-    const items = (data ?? []).map((r) => ({
-      id: r.id,
-      name: r.name,
-      description: r.description,
-      permissions: (r as any).role_permissions
-        .map((rp: any) => rp.permissions)
-        .filter(Boolean),
-    }));
+    const items = await roles
+      .aggregate([
+        { $sort: { name: 1 } },
+        {
+          $lookup: {
+            from: collections.permissions,
+            localField: "permissionIds",
+            foreignField: "_id",
+            as: "permissions",
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            id: { $toString: "$_id" },
+            name: 1,
+            description: 1,
+            permissions: {
+              $map: {
+                input: "$permissions",
+                as: "p",
+                in: {
+                  id: { $toString: "$$p._id" },
+                  key: "$$p.key",
+                  description: "$$p.description",
+                },
+              },
+            },
+          },
+        },
+      ])
+      .toArray();
     return json({ items });
   }
 
@@ -41,45 +68,44 @@ export const handler = withAuth(async (event, ctx) => {
   if (event.httpMethod === "POST" && seg.length === 0) {
     const body = parseJson<CreateRoleBody>(event);
     if (!body?.name?.trim()) return error("name is required");
-    const { data, error: e } = await sb
-      .from("roles")
-      .insert({ name: body.name.trim(), description: body.description ?? null })
-      .select("id, name, description")
-      .single();
-    if (e) return error(e.message, 400);
-    if (body.permissionIds?.length) {
-      const rows = body.permissionIds.map((pid) => ({ role_id: data.id, permission_id: pid }));
-      const { error: e2 } = await sb
-        .from("role_permissions")
-        .upsert(rows, { onConflict: "role_id,permission_id", ignoreDuplicates: true });
-      if (e2) return error(e2.message, 400);
+    try {
+      const result = await roles.insertOne({
+        name: body.name.trim(),
+        description: body.description?.trim() || null,
+        permissionIds: toOidArray(body.permissionIds),
+      });
+      await writeAudit({
+        actorUserId: ctx.userId,
+        action: "CREATE_ROLE",
+        roleId: result.insertedId,
+        metadata: { name: body.name.trim(), permissionIds: body.permissionIds ?? [] },
+      });
+      return json(
+        { id: result.insertedId.toString(), name: body.name.trim(), description: body.description ?? null },
+        201
+      );
+    } catch (e: any) {
+      if (e?.code === 11000) return error("A role with that name already exists", 409);
+      throw e;
     }
-    await writeAudit({
-      actorUserId: ctx.userId,
-      action: "CREATE_ROLE",
-      roleId: data.id,
-      metadata: { name: data.name, permissionIds: body.permissionIds ?? [] },
-    });
-    return json(data, 201);
   }
 
   // POST /roles/:id/permissions → assign permissions to a role
   if (event.httpMethod === "POST" && seg.length === 2 && seg[1] === "permissions") {
-    const roleId = seg[0];
+    const roleId = tryOid(seg[0]);
+    if (!roleId) return error("invalid role id", 400);
     const body = parseJson<AssignPermsBody>(event);
     if (!body?.permissionIds || !Array.isArray(body.permissionIds)) {
       return error("permissionIds (array) required");
     }
+    const permIds = toOidArray(body.permissionIds);
     if (body.replace) {
-      const { error: eDel } = await sb.from("role_permissions").delete().eq("role_id", roleId);
-      if (eDel) return error(eDel.message, 400);
-    }
-    if (body.permissionIds.length) {
-      const rows = body.permissionIds.map((pid) => ({ role_id: roleId, permission_id: pid }));
-      const { error: e } = await sb
-        .from("role_permissions")
-        .upsert(rows, { onConflict: "role_id,permission_id", ignoreDuplicates: true });
-      if (e) return error(e.message, 400);
+      await roles.updateOne({ _id: roleId }, { $set: { permissionIds: permIds } });
+    } else {
+      await roles.updateOne(
+        { _id: roleId },
+        { $addToSet: { permissionIds: { $each: permIds } } }
+      );
     }
     await writeAudit({
       actorUserId: ctx.userId,

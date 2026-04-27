@@ -10,7 +10,7 @@ import {
   ScrollText,
 } from "lucide-react";
 import { useSession } from "./hooks/useSession";
-import { supabase } from "./lib/supabase";
+import { logout } from "./lib/auth";
 import { Button } from "./components/ui/button";
 import { cn } from "./lib/cn";
 import Login from "./pages/Login";
@@ -80,7 +80,7 @@ function Shell({ children }: { children: React.ReactNode }) {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => supabase.auth.signOut()}
+              onClick={() => logout()}
               title="Sign out"
             >
               <LogOut className="h-4 w-4" />

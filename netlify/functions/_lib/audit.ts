@@ -1,4 +1,5 @@
-import { getServiceClient } from "./supabase.js";
+import { ObjectId } from "mongodb";
+import { collections, getDb } from "./db.js";
 
 export type AuditAction =
   | "ADD_MEMBER"
@@ -12,23 +13,32 @@ export type AuditAction =
   | "CREATE_USER";
 
 export interface AuditEntry {
-  actorUserId: string;
+  actorUserId: string | ObjectId;
   action: AuditAction;
-  teamId?: string | null;
-  targetUserId?: string | null;
-  roleId?: string | null;
+  teamId?: string | ObjectId | null;
+  targetUserId?: string | ObjectId | null;
+  roleId?: string | ObjectId | null;
   metadata?: Record<string, unknown> | null;
 }
 
+function toOid(v: string | ObjectId | null | undefined): ObjectId | null {
+  if (v == null) return null;
+  return v instanceof ObjectId ? v : new ObjectId(v);
+}
+
 export async function writeAudit(entry: AuditEntry): Promise<void> {
-  const sb = getServiceClient();
-  const { error } = await sb.from("audit_log").insert({
-    actor_user_id: entry.actorUserId,
-    action: entry.action,
-    team_id: entry.teamId ?? null,
-    target_user_id: entry.targetUserId ?? null,
-    role_id: entry.roleId ?? null,
-    metadata: entry.metadata ?? null,
-  });
-  if (error) console.error("audit insert failed", error);
+  try {
+    const db = await getDb();
+    await db.collection(collections.auditLog).insertOne({
+      actorUserId: toOid(entry.actorUserId),
+      action: entry.action,
+      teamId: toOid(entry.teamId),
+      targetUserId: toOid(entry.targetUserId),
+      roleId: toOid(entry.roleId),
+      metadata: entry.metadata ?? null,
+      createdAt: new Date(),
+    });
+  } catch (e) {
+    console.error("audit insert failed", e);
+  }
 }

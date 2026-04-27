@@ -1,4 +1,4 @@
-import { supabase } from "./supabase";
+import { getToken, logout } from "./auth";
 
 const BASE = "/.netlify/functions";
 
@@ -9,16 +9,14 @@ export class ApiError extends Error {
   }
 }
 
-async function authHeader(): Promise<HeadersInit> {
-  const { data } = await supabase.auth.getSession();
-  const token = data.session?.access_token;
+function authHeader(): HeadersInit {
+  const token = getToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 function friendly(status: number, backendMessage?: string): string {
   if (status === 401) return "Unauthorized — please sign in again.";
   if (status === 403) {
-    // Backend message looks like "Missing required permission: ASSIGN_ROLES".
     const perm = backendMessage?.match(/permission:\s*([A-Z_]+)/)?.[1];
     return perm
       ? `Unauthorized — your role doesn't grant ${perm} in this team.`
@@ -32,7 +30,7 @@ function friendly(status: number, backendMessage?: string): string {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: HeadersInit = {
     "content-type": "application/json",
-    ...(await authHeader()),
+    ...authHeader(),
     ...(init.headers ?? {}),
   };
   const res = await fetch(`${BASE}${path}`, { ...init, headers });
@@ -44,6 +42,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       // ignore
     }
+    if (res.status === 401) logout();
     throw new ApiError(friendly(res.status, backendMessage), res.status, backendMessage);
   }
   if (res.status === 204) return undefined as T;

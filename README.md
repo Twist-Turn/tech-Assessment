@@ -2,7 +2,7 @@
 
 Full-stack RBAC app: users belong to teams, get one or more roles per team, and roles bundle permissions. Permissions are resolved per `(user, team)` and enforced both server-side (middleware) and in the UI.
 
-**Stack:** React + Vite + Tailwind + shadcn-style primitives · Netlify Functions (TypeScript) · Supabase (Postgres + Auth)
+**Stack:** React + Vite + Tailwind · Netlify Functions (TypeScript) · **MongoDB Atlas** · custom JWT auth (bcrypt + HS256)
 
 ---
 
@@ -15,41 +15,39 @@ The core idea:
 - **Permissions** are atomic actions (`CREATE_TASK`, `EDIT_TASK`, `DELETE_TASK`, `VIEW_ONLY`, `MANAGE_TEAM`, `MANAGE_MEMBERS`, `ASSIGN_ROLES`).
 - **Roles** are reusable bundles of permissions (e.g. *Admin*, *Manager*, *Viewer*).
 - **Teams** are the scope. A user's permissions are computed from the roles they hold *in that specific team* — not globally.
-- **No role in a team → no permissions in that team.** This is enforced literally: the resolver returns an empty set.
+- **No role in a team → no permissions in that team.**
 - **Multiple roles per (user, team)** are supported. The effective permission set is the **union** of all assigned roles.
 
-The dashboard lets you pick any `(team, user)` pair and see exactly what they're allowed to do, with the same logic that the backend uses to gate API calls. So what the UI shows and what the server enforces can never drift apart.
+The dashboard lets you pick any `(team, user)` pair and see exactly what they're allowed to do, with the same logic that the backend uses to gate API calls.
 
 ### Why this design
 
 | Choice | Why |
 |---|---|
-| Permissions are global, not per-team | Roles are reusable across teams; a single permission catalog keeps the model simple. |
-| Roles are global too | Same reason — *Admin* means the same thing wherever it's used. |
-| The `(user, team, role)` triple is the join | Lets a user have different roles in different teams *and* multiple roles in one team. |
-| Service-role key on the server only | All data access goes through Netlify Functions; the browser never holds a key that bypasses RLS. |
-| RLS enabled and **deny-all** | The only path to data is through middleware-checked endpoints. No accidental leaks. |
-| JWT verified via Supabase JWKS | Asymmetric (ES256/RS256) — no shared secret to manage. |
+| Permissions and roles are global, scopes are per-team | Roles like *Admin* mean the same thing across teams; only the `(user, team, role)` join changes per scope. |
+| `userTeamRoles` collection with composite uniqueness on `(userId, teamId, roleId)` | Lets a user hold different roles in different teams *and* multiple roles in one team without duplicates. |
+| Custom JWT auth (HS256) signed by Functions | The spec calls for "MERN + JWT". No third-party auth dependency; bcrypt-hashed passwords live in Mongo. |
+| Mongo client cached across lambda invocations | Atlas free-tier connection limits + serverless cold starts. |
+| All data access goes through Functions | The connection string is server-only; the browser only ever holds a short-lived JWT. |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────┐    Bearer JWT     ┌────────────────────────┐    service-role    ┌──────────────┐
-│  React SPA       │ ────────────────▶ │  Netlify Functions     │ ─────────────────▶ │  Supabase    │
-│  (Vite/Tailwind) │                   │  • requireAuth (JWKS)  │                    │  Postgres    │
-│  • TeamSelector  │ ◀──────────────── │  • requirePermission   │ ◀───────────────── │  + RLS       │
-│  • UserPicker    │      JSON         │  • writeAudit          │                    │  + auth.users│
-│  • Permission    │                   └────────────────────────┘                    └──────┬───────┘
-│    Grid          │                                                                        │
-└────────┬─────────┘                                                                        │
-         │ supabase-js (anon key) — Auth only (signup / login / refresh)                    │
-         └────────────────────────────────────────────────────────────────────────────────▶ │
-                                                                                  Supabase Auth
+┌──────────────────┐    Bearer JWT     ┌────────────────────────┐    MongoClient    ┌──────────────┐
+│  React SPA       │ ────────────────▶ │  Netlify Functions     │ ────────────────▶ │  MongoDB     │
+│  (Vite/Tailwind) │                   │  • requireAuth (HS256) │                   │  Atlas       │
+│  • TeamSelector  │ ◀──────────────── │  • requirePermission   │ ◀──────────────── │  (rengy DB)  │
+│  • UserPicker    │      JSON         │  • writeAudit          │                   └──────────────┘
+│  • Permission    │                   └────────────────────────┘
+│    Grid          │                              │
+└────────┬─────────┘                              │ POST /auth-login, /auth-signup
+         │                                        │ (bcrypt compare → sign JWT)
+         └─── stores JWT in localStorage  ────────┘
 ```
 
-The browser never talks to the database directly. It only talks to **Supabase Auth** (to obtain a JWT) and to the **Netlify Functions** (to read/write data with that JWT). The Functions verify the JWT, check the caller's permissions in the relevant team, then operate on Postgres using the service-role key.
+The browser holds a JWT in `localStorage` (issued by `/auth-login` or `/auth-signup`) and includes it on every request. Every Function except the auth endpoints calls `requireAuth(event)` which verifies the token's HS256 signature with `JWT_SECRET`. Mutating endpoints additionally call `requirePermission(userId, teamId, perm)` which runs an aggregation against MongoDB to compute the caller's effective permissions in that team.
 
 ---
 
@@ -57,82 +55,80 @@ The browser never talks to the database directly. It only talks to **Supabase Au
 
 ```mermaid
 classDiagram
-    class Profile {
-        +uuid id (PK, FK→auth.users)
-        +text name
-        +text email (unique)
-        +timestamptz created_at
+    class User {
+        +ObjectId _id (PK)
+        +string name
+        +string email (unique)
+        +string passwordHash
+        +Date createdAt
     }
 
     class Team {
-        +uuid id (PK)
-        +text name
-        +uuid created_by (FK→Profile)
-        +timestamptz created_at
+        +ObjectId _id (PK)
+        +string name
+        +ObjectId createdBy (FK→User)
+        +Date createdAt
     }
 
-    class TeamMembership {
-        +uuid user_id (PK, FK→Profile)
-        +uuid team_id (PK, FK→Team)
-        +timestamptz joined_at
+    class Membership {
+        +ObjectId userId (FK→User)
+        +ObjectId teamId (FK→Team)
+        +Date joinedAt
+        unique(userId, teamId)
     }
 
     class Role {
-        +uuid id (PK)
-        +text name (unique)
-        +text description
+        +ObjectId _id (PK)
+        +string name (unique)
+        +string description
+        +ObjectId[] permissionIds (FK→Permission[])
     }
 
     class Permission {
-        +uuid id (PK)
-        +text key (unique)
-        +text description
-    }
-
-    class RolePermission {
-        +uuid role_id (PK, FK→Role)
-        +uuid permission_id (PK, FK→Permission)
+        +ObjectId _id (PK)
+        +string key (unique)
+        +string description
     }
 
     class UserTeamRole {
-        +uuid user_id (PK, FK→Profile)
-        +uuid team_id (PK, FK→Team)
-        +uuid role_id (PK, FK→Role)
-        +uuid assigned_by (FK→Profile)
-        +timestamptz assigned_at
+        +ObjectId userId (FK→User)
+        +ObjectId teamId (FK→Team)
+        +ObjectId roleId (FK→Role)
+        +ObjectId assignedBy (FK→User)
+        +Date assignedAt
+        unique(userId, teamId, roleId)
     }
 
     class AuditLog {
-        +bigserial id (PK)
-        +uuid actor_user_id (FK→Profile)
-        +text action
-        +uuid team_id (FK→Team)
-        +uuid target_user_id (FK→Profile)
-        +uuid role_id (FK→Role)
-        +jsonb metadata
-        +timestamptz created_at
+        +ObjectId _id (PK)
+        +ObjectId actorUserId (FK→User)
+        +string action
+        +ObjectId teamId (FK→Team)
+        +ObjectId targetUserId (FK→User)
+        +ObjectId roleId (FK→Role)
+        +Object metadata
+        +Date createdAt
     }
 
-    Profile "1" -- "*" TeamMembership : member of
-    Team    "1" -- "*" TeamMembership : has
+    User "1" -- "*" Membership : member of
+    Team "1" -- "*" Membership : has
 
-    Role       "1" -- "*" RolePermission : grants
-    Permission "1" -- "*" RolePermission : granted by
+    Role       "1" -- "*" Permission : grants (via permissionIds[])
 
-    Profile "1" -- "*" UserTeamRole : holds
-    Team    "1" -- "*" UserTeamRole : scoped to
-    Role    "1" -- "*" UserTeamRole : assigned
+    User "1" -- "*" UserTeamRole : holds
+    Team "1" -- "*" UserTeamRole : scoped to
+    Role "1" -- "*" UserTeamRole : assigned
 
-    Profile "1" -- "*" AuditLog : actor / target
-    Team    "1" -- "*" AuditLog : context
-    Role    "1" -- "*" AuditLog : subject
+    User "1" -- "*" AuditLog : actor / target
+    Team "1" -- "*" AuditLog : context
+    Role "1" -- "*" AuditLog : subject
 ```
 
 **Key relationships:**
 
-- `team_memberships` is a pure many-to-many between `Profile` and `Team`.
-- `role_permissions` is a pure many-to-many between `Role` and `Permission`.
-- `user_team_roles` is the **three-way join** that drives everything. Its composite PK `(user_id, team_id, role_id)` allows a user to hold *multiple roles* in one team while preventing duplicate assignments.
+- `memberships` is a pure many-to-many between `User` and `Team`.
+- `roles.permissionIds` is an embedded array of permission ObjectIds — a denormalized many-to-many, fast for the hot resolver path.
+- `userTeamRoles` is the **three-way join** that drives everything. Its compound unique index on `(userId, teamId, roleId)` allows a user to hold *multiple roles* in one team while preventing duplicates.
 
 ---
 
@@ -146,30 +142,28 @@ sequenceDiagram
     actor Browser
     participant SPA as React SPA
     participant Fn as Netlify Function<br/>(resolve-permissions)
-    participant Auth as JWKS<br/>(Supabase)
-    participant DB as Postgres<br/>(Supabase)
+    participant DB as MongoDB Atlas
 
     Browser->>SPA: select (team, user)
     SPA->>Fn: GET /resolve-permissions?userId=&teamId=<br/>Authorization: Bearer JWT
-    Fn->>Auth: fetch JWKS (cached)
-    Auth-->>Fn: ES256 public key
-    Fn->>Fn: verify JWT → caller userId
-    Fn->>DB: SELECT permissions via<br/>user_team_roles ⨝ role_permissions ⨝ permissions<br/>WHERE user_id=? AND team_id=?
+    Fn->>Fn: jose.jwtVerify (HS256, JWT_SECRET) → callerId
+    Fn->>DB: aggregate userTeamRoles<br/>$match {userId, teamId}<br/>$lookup roles → role.permissionIds<br/>$lookup permissions → key
     DB-->>Fn: rows of permission keys + role names
+    Fn->>Fn: dedupe permissions across roles
     Fn-->>SPA: { permissions: [...], roles: [...] }
     SPA->>Browser: render PermissionGrid<br/>(grouped: tasks vs admin)
 ```
 
 **Notes:**
-- The JWKS is fetched once per Function instance and cached by `jose.createRemoteJWKSet`.
-- The query returns the **distinct union** of permission keys across every role the user has in that team — handling the "multiple roles per (user, team)" case automatically.
-- If the user has no rows in `user_team_roles` for that team, the result is `{ permissions: [], roles: [] }` — the "no role → no permissions" rule.
+- The MongoClient is cached across Lambda invocations to avoid TLS handshakes on every cold start.
+- The aggregation returns the **union** of permission keys across every role the user has in that team.
+- If `userTeamRoles` has no document matching `(userId, teamId)`, the result is `{ permissions: [], roles: [] }` — the "no role → no permissions" rule.
 
 ---
 
 ## Sequence — performing a protected action
 
-This shows what happens when a user attempts a mutation (e.g. assigning a role). The middleware re-runs the same resolver before allowing the change.
+This shows what happens when a user attempts a mutation (e.g. assigning a role).
 
 ```mermaid
 sequenceDiagram
@@ -178,20 +172,20 @@ sequenceDiagram
     participant SPA as React SPA
     participant Fn as Netlify Function<br/>(assignments)
     participant Mw as requirePermission<br/>middleware
-    participant DB as Postgres
-    participant Audit as audit_log
+    participant DB as MongoDB Atlas
+    participant Audit as auditLog
 
     Browser->>SPA: click "Assign role"
     SPA->>Fn: POST /assignments<br/>{ userId, teamId, roleId }<br/>Authorization: Bearer JWT
-    Fn->>Fn: verifyJwt → callerId
+    Fn->>Fn: jwtVerify → callerId
     Fn->>Mw: requirePermission(callerId, teamId, "ASSIGN_ROLES")
-    Mw->>DB: resolve permissions for (callerId, teamId)
+    Mw->>DB: aggregate permissions for (callerId, teamId)
 
     alt caller has ASSIGN_ROLES
         Mw-->>Fn: ✅ pass
-        Fn->>DB: UPSERT team_memberships
-        Fn->>DB: UPSERT user_team_roles
-        Fn->>Audit: INSERT (action="ASSIGN_ROLE", actor, target, team, role)
+        Fn->>DB: upsert memberships {userId, teamId}
+        Fn->>DB: upsert userTeamRoles {userId, teamId, roleId}
+        Fn->>Audit: insertOne (action="ASSIGN_ROLE", actor, target, team, role)
         Fn-->>SPA: 201 { ok: true }
         SPA->>Browser: toast "Role assigned" + reload
     else caller lacks ASSIGN_ROLES
@@ -205,24 +199,27 @@ sequenceDiagram
 **Notes:**
 - Every mutating endpoint runs the same `requirePermission` check — the rules can't be bypassed by hitting the API directly with a valid login JWT.
 - The audit row is written **after** the change, with the actor, target, team, role, and `metadata` (e.g. the previous role for an `UPDATE_ROLE`).
-- The frontend's [`api.ts`](src/lib/api.ts) maps `401`/`403` HTTP statuses into human-readable messages so callers don't have to think about it.
+- Creating a team also auto-grants the creator the **Admin** role on that team (and writes an `ASSIGN_ROLE` audit row alongside the `CREATE_TEAM` row).
 
 ---
 
 ## API surface
 
-All endpoints sit at `/.netlify/functions/<name>` (also aliased to `/api/<name>` via `netlify.toml`). All require `Authorization: Bearer <JWT>` except the auth flow itself (which goes directly to Supabase Auth from the browser).
+All endpoints sit at `/.netlify/functions/<name>` (also aliased to `/api/<name>` via `netlify.toml`). All require `Authorization: Bearer <JWT>` except `/auth-login` and `/auth-signup`.
 
 | Endpoint | Methods | Purpose | Permission required |
 |---|---|---|---|
-| `/users` | GET, POST | List (search + paginate) / create | – / authed |
-| `/teams` | GET, POST | List (paginate) / create | – / authed |
+| `/auth-signup` | POST | Create account, return JWT | – |
+| `/auth-login` | POST | Verify credentials, return JWT | – |
+| `/auth-me` | GET | Return the current user | authed |
+| `/users` | GET, POST | List (search + paginate) / create | authed |
+| `/teams` | GET, POST | List (paginate) / create (creator becomes Admin) | authed |
 | `/memberships` | GET, POST, DELETE | List members or user's teams / add / remove | – / `MANAGE_MEMBERS` / `MANAGE_MEMBERS` |
-| `/roles` | GET, POST | List with permissions / create | – / authed |
+| `/roles` | GET, POST | List with permissions / create | authed |
 | `/roles/:id/permissions` | POST | Replace or extend a role's permission set | authed |
-| `/permissions` | GET | List all permission keys | – |
+| `/permissions` | GET | List all permission keys | authed |
 | `/assignments` | GET, POST, PUT, DELETE | List / assign / swap / remove role-in-team | – / `ASSIGN_ROLES` (mutations) |
-| `/resolve-permissions` | GET | `{ permissions, roles }` for `(userId, teamId)` | – |
+| `/resolve-permissions` | GET | `{ permissions, roles }` for `(userId, teamId)` | authed |
 | `/audit` | GET | Audit log feed | needs `MANAGE_TEAM` ∨ `MANAGE_MEMBERS` ∨ `ASSIGN_ROLES` *anywhere* |
 
 ---
@@ -230,14 +227,13 @@ All endpoints sit at `/.netlify/functions/<name>` (also aliased to `/api/<name>`
 ## Setup
 
 1. `npm install`
-2. Create a Supabase project. From **Project Settings → API** copy:
-   - Project URL → `SUPABASE_URL` and `VITE_SUPABASE_URL`
-   - `anon` public key → `VITE_SUPABASE_ANON_KEY`
-   - `service_role` secret key → `SUPABASE_SERVICE_ROLE_KEY`
-   (JWT verification uses the project's JWKS endpoint automatically — no JWT secret needed.)
-3. `cp .env.example .env` and paste values.
-4. Run the migration: in Supabase **SQL Editor**, paste the contents of [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) and execute.
-5. Seed: `npm run seed` (creates Admin/Manager/Viewer roles, the 7 permissions, two demo teams, and two demo users).
+2. Create a MongoDB Atlas cluster (free tier is fine). In **Database Access** create a user; in **Network Access** allow your IP (and `0.0.0.0/0` for the Netlify deploy).
+3. `cp .env.example .env` and fill in:
+   - `MONGODB_URI` — your Atlas connection string (with username + password)
+   - `MONGODB_DB` — keep `rengy` or pick another name
+   - `JWT_SECRET` — generate with `openssl rand -base64 32`
+4. Create indexes: `npm run db:init`
+5. Seed demo data: `npm run seed` (creates Admin/Manager/Viewer roles, the 7 permissions, two demo teams, and two demo users).
 6. `npm install -g netlify-cli` then `netlify dev` — opens the SPA on http://localhost:8888 with functions on the same origin.
 
 ## Demo credentials (after `npm run seed`)
@@ -254,4 +250,4 @@ Log in as Alice → Dashboard auto-selects her and her first team → permission
 - **Team Alpha**: all 7 permissions granted (role: *Admin*).
 - **Team Beta**: only `VIEW_ONLY` granted (role: *Viewer*).
 
-This is the literal scenario from the brief — and the same query that drives the UI is what the backend uses to gate every mutation.
+This is the literal scenario from the brief — and the same aggregation that drives the UI is what the backend uses to gate every mutation.

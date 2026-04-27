@@ -2,7 +2,7 @@ import { FormEvent, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { ShieldCheck, Sparkles, UserCircle2 } from "lucide-react";
-import { supabase } from "../lib/supabase";
+import { login as doLogin } from "../lib/auth";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
@@ -33,13 +33,14 @@ export default function Login() {
     e?.preventDefault();
     const creds = override ?? { email, password };
     setBusy(true);
-    const { error } = await supabase.auth.signInWithPassword(creds);
-    setBusy(false);
-    if (error) {
-      toast.error(error.message);
-      return;
+    try {
+      await doLogin(creds.email, creds.password);
+      nav("/", { replace: true });
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setBusy(false);
     }
-    nav("/", { replace: true });
   };
 
   return (
@@ -67,7 +68,7 @@ export default function Login() {
           </ul>
         </div>
         <div className="text-xs text-slate-500">
-          Postgres + Supabase Auth · Netlify Functions · React + Vite
+          MongoDB Atlas · Netlify Functions · React + Vite · custom JWT
         </div>
       </div>
 

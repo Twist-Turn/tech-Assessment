@@ -1,6 +1,7 @@
 import { withAuth } from "./_lib/handler.js";
 import { json, error, parseJson, pathSegments } from "./_lib/http.js";
-import { getServiceClient } from "./_lib/supabase.js";
+import { collections, getDb } from "./_lib/db.js";
+import { tryOid } from "./_lib/serialize.js";
 import { writeAudit } from "./_lib/audit.js";
 import { requirePermission } from "./_lib/permissions.js";
 
@@ -16,56 +17,104 @@ interface UpdateBody extends AssignBody {
 }
 
 export const handler = withAuth(async (event, ctx) => {
-  const sb = getServiceClient();
+  const db = await getDb();
+  const utr = db.collection(collections.userTeamRoles);
 
-  // GET /assignments?teamId=...&userId=... → list role assignments (any combination)
+  // GET /assignments?teamId=...&userId=... → list role assignments
   if (event.httpMethod === "GET") {
-    const teamId = event.queryStringParameters?.teamId;
-    const userId = event.queryStringParameters?.userId;
-    let q = sb
-      .from("user_team_roles")
-      .select(
-        "user_id, team_id, role_id, assigned_at, " +
-          "profiles:profiles!user_id ( id, name, email ), " +
-          "teams ( id, name ), roles ( id, name )"
-      )
-      .order("assigned_at", { ascending: false });
-    if (teamId) q = q.eq("team_id", teamId);
-    if (userId) q = q.eq("user_id", userId);
-    const { data, error: e } = await q;
-    if (e) return error(e.message, 500);
-    return json({ items: data });
+    const teamId = tryOid(event.queryStringParameters?.teamId);
+    const userId = tryOid(event.queryStringParameters?.userId);
+    const match: Record<string, unknown> = {};
+    if (teamId) match.teamId = teamId;
+    if (userId) match.userId = userId;
+
+    const items = await utr
+      .aggregate([
+        { $match: match },
+        { $sort: { assignedAt: -1 } },
+        {
+          $lookup: {
+            from: collections.users,
+            localField: "userId",
+            foreignField: "_id",
+            as: "user",
+          },
+        },
+        { $unwind: "$user" },
+        {
+          $lookup: {
+            from: collections.teams,
+            localField: "teamId",
+            foreignField: "_id",
+            as: "team",
+          },
+        },
+        { $unwind: "$team" },
+        {
+          $lookup: {
+            from: collections.roles,
+            localField: "roleId",
+            foreignField: "_id",
+            as: "role",
+          },
+        },
+        { $unwind: "$role" },
+        {
+          $project: {
+            _id: 0,
+            user_id: { $toString: "$userId" },
+            team_id: { $toString: "$teamId" },
+            role_id: { $toString: "$roleId" },
+            assigned_at: "$assignedAt",
+            profiles: {
+              id: { $toString: "$user._id" },
+              name: "$user.name",
+              email: "$user.email",
+            },
+            teams: { id: { $toString: "$team._id" }, name: "$team.name" },
+            roles: { id: { $toString: "$role._id" }, name: "$role.name" },
+          },
+        },
+      ])
+      .toArray();
+    return json({ items });
   }
 
-  // POST /assignments → assign role to user in team
+  // POST /assignments
   if (event.httpMethod === "POST") {
     const body = parseJson<AssignBody>(event);
-    if (!body?.userId || !body.teamId || !body.roleId) {
-      return error("userId, teamId, roleId required");
-    }
-    await requirePermission(ctx.userId, body.teamId, "ASSIGN_ROLES");
+    const userId = tryOid(body?.userId);
+    const teamId = tryOid(body?.teamId);
+    const roleId = tryOid(body?.roleId);
+    if (!userId || !teamId || !roleId) return error("userId, teamId, roleId required");
 
-    // Ensure membership exists.
-    await sb
-      .from("team_memberships")
-      .upsert({ user_id: body.userId, team_id: body.teamId }, { onConflict: "user_id,team_id" });
+    await requirePermission(ctx.userId, teamId, "ASSIGN_ROLES");
 
-    const { error: e } = await sb.from("user_team_roles").upsert(
-      {
-        user_id: body.userId,
-        team_id: body.teamId,
-        role_id: body.roleId,
-        assigned_by: ctx.userId,
-      },
-      { onConflict: "user_id,team_id,role_id" }
+    const now = new Date();
+    await db.collection(collections.memberships).updateOne(
+      { userId, teamId },
+      { $setOnInsert: { userId, teamId, joinedAt: now } },
+      { upsert: true }
     );
-    if (e) return error(e.message, 400);
+    await utr.updateOne(
+      { userId, teamId, roleId },
+      {
+        $setOnInsert: {
+          userId,
+          teamId,
+          roleId,
+          assignedBy: tryOid(ctx.userId),
+          assignedAt: now,
+        },
+      },
+      { upsert: true }
+    );
     await writeAudit({
       actorUserId: ctx.userId,
       action: "ASSIGN_ROLE",
-      teamId: body.teamId,
-      targetUserId: body.userId,
-      roleId: body.roleId,
+      teamId,
+      targetUserId: userId,
+      roleId,
     });
     return json({ ok: true }, 201);
   }
@@ -73,34 +122,36 @@ export const handler = withAuth(async (event, ctx) => {
   // PUT /assignments → swap fromRoleId for roleId for (user, team)
   if (event.httpMethod === "PUT") {
     const body = parseJson<UpdateBody>(event);
-    if (!body?.userId || !body.teamId || !body.roleId || !body.fromRoleId) {
+    const userId = tryOid(body?.userId);
+    const teamId = tryOid(body?.teamId);
+    const roleId = tryOid(body?.roleId);
+    const fromRoleId = tryOid(body?.fromRoleId);
+    if (!userId || !teamId || !roleId || !fromRoleId) {
       return error("userId, teamId, fromRoleId, roleId required");
     }
-    await requirePermission(ctx.userId, body.teamId, "ASSIGN_ROLES");
-    const { error: eDel } = await sb
-      .from("user_team_roles")
-      .delete()
-      .eq("user_id", body.userId)
-      .eq("team_id", body.teamId)
-      .eq("role_id", body.fromRoleId);
-    if (eDel) return error(eDel.message, 400);
-    const { error: eIns } = await sb.from("user_team_roles").upsert(
+    await requirePermission(ctx.userId, teamId, "ASSIGN_ROLES");
+    await utr.deleteOne({ userId, teamId, roleId: fromRoleId });
+    const now = new Date();
+    await utr.updateOne(
+      { userId, teamId, roleId },
       {
-        user_id: body.userId,
-        team_id: body.teamId,
-        role_id: body.roleId,
-        assigned_by: ctx.userId,
+        $setOnInsert: {
+          userId,
+          teamId,
+          roleId,
+          assignedBy: tryOid(ctx.userId),
+          assignedAt: now,
+        },
       },
-      { onConflict: "user_id,team_id,role_id" }
+      { upsert: true }
     );
-    if (eIns) return error(eIns.message, 400);
     await writeAudit({
       actorUserId: ctx.userId,
       action: "UPDATE_ROLE",
-      teamId: body.teamId,
-      targetUserId: body.userId,
-      roleId: body.roleId,
-      metadata: { fromRoleId: body.fromRoleId },
+      teamId,
+      targetUserId: userId,
+      roleId,
+      metadata: { fromRoleId: body?.fromRoleId },
     });
     return json({ ok: true });
   }
@@ -108,20 +159,14 @@ export const handler = withAuth(async (event, ctx) => {
   // DELETE /assignments/:teamId/:userId/:roleId
   if (event.httpMethod === "DELETE") {
     const seg = pathSegments(event, "assignments");
-    const teamId = seg[0] || event.queryStringParameters?.teamId;
-    const userId = seg[1] || event.queryStringParameters?.userId;
-    const roleId = seg[2] || event.queryStringParameters?.roleId;
+    const teamId = tryOid(seg[0] || event.queryStringParameters?.teamId);
+    const userId = tryOid(seg[1] || event.queryStringParameters?.userId);
+    const roleId = tryOid(seg[2] || event.queryStringParameters?.roleId);
     if (!teamId || !userId || !roleId) {
       return error("teamId, userId, roleId required");
     }
     await requirePermission(ctx.userId, teamId, "ASSIGN_ROLES");
-    const { error: e } = await sb
-      .from("user_team_roles")
-      .delete()
-      .eq("user_id", userId)
-      .eq("team_id", teamId)
-      .eq("role_id", roleId);
-    if (e) return error(e.message, 400);
+    await utr.deleteOne({ userId, teamId, roleId });
     await writeAudit({
       actorUserId: ctx.userId,
       action: "REMOVE_ROLE",

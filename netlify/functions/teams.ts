@@ -1,90 +1,109 @@
+import { ObjectId } from "mongodb";
 import { withAuth } from "./_lib/handler.js";
 import { json, error, parseJson } from "./_lib/http.js";
-import { getServiceClient } from "./_lib/supabase.js";
+import { collections, getDb } from "./_lib/db.js";
+import { serialize } from "./_lib/serialize.js";
 import { writeAudit } from "./_lib/audit.js";
 
 interface CreateTeamBody {
   name?: string;
 }
 
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 export const handler = withAuth(async (event, ctx) => {
-  const sb = getServiceClient();
+  const db = await getDb();
+  const teams = db.collection(collections.teams);
 
   if (event.httpMethod === "GET") {
     const q = (event.queryStringParameters?.q || "").trim();
     const limit = Math.min(parseInt(event.queryStringParameters?.limit || "50", 10) || 50, 100);
     const cursor = event.queryStringParameters?.cursor;
 
-    let query = sb
-      .from("teams")
-      .select("id, name, created_at, created_by")
-      .order("created_at", { ascending: false })
-      .limit(limit + 1);
-    if (cursor) query = query.lt("created_at", cursor);
-    if (q) query = query.ilike("name", `%${q}%`);
+    const filter: Record<string, unknown> = {};
+    if (q) filter.name = new RegExp(escapeRegex(q), "i");
+    if (cursor) {
+      const d = new Date(cursor);
+      if (!isNaN(d.getTime())) filter.createdAt = { $lt: d };
+    }
 
-    const { data, error: e } = await query;
-    if (e) return error(e.message, 500);
-    const hasMore = data.length > limit;
-    const items = hasMore ? data.slice(0, limit) : data;
+    const docs = await teams.find(filter).sort({ createdAt: -1 }).limit(limit + 1).toArray();
+    const hasMore = docs.length > limit;
+    const items = (hasMore ? docs.slice(0, limit) : docs).map((t) => serialize(t));
     return json({
       items,
-      nextCursor: hasMore ? items[items.length - 1].created_at : null,
+      nextCursor: hasMore ? (items[items.length - 1] as any).createdAt : null,
     });
   }
 
   if (event.httpMethod === "POST") {
     const body = parseJson<CreateTeamBody>(event);
     if (!body?.name?.trim()) return error("name is required");
-    const { data, error: e } = await sb
-      .from("teams")
-      .insert({ name: body.name.trim(), created_by: ctx.userId })
-      .select("id, name, created_at")
-      .single();
-    if (e) return error(e.message, 400);
 
-    // Auto-add the creator as a member and grant them the Admin role on this team.
-    await sb
-      .from("team_memberships")
-      .upsert({ user_id: ctx.userId, team_id: data.id }, { onConflict: "user_id,team_id" });
+    const actor = new ObjectId(ctx.userId);
+    const now = new Date();
+    const result = await teams.insertOne({
+      name: body.name.trim(),
+      createdBy: actor,
+      createdAt: now,
+    });
+    const teamId = result.insertedId;
 
-    const { data: adminRole } = await sb
-      .from("roles")
-      .select("id, name")
-      .ilike("name", "Admin")
-      .maybeSingle();
+    // Auto-add creator as a member.
+    await db
+      .collection(collections.memberships)
+      .updateOne(
+        { userId: actor, teamId },
+        { $setOnInsert: { userId: actor, teamId, joinedAt: now } },
+        { upsert: true }
+      );
 
+    // Auto-grant creator the Admin role on this team.
+    const adminRole = await db
+      .collection(collections.roles)
+      .findOne({ name: { $regex: /^admin$/i } });
     if (adminRole) {
-      await sb.from("user_team_roles").upsert(
+      await db.collection(collections.userTeamRoles).updateOne(
+        { userId: actor, teamId, roleId: adminRole._id },
         {
-          user_id: ctx.userId,
-          team_id: data.id,
-          role_id: adminRole.id,
-          assigned_by: ctx.userId,
+          $setOnInsert: {
+            userId: actor,
+            teamId,
+            roleId: adminRole._id,
+            assignedBy: actor,
+            assignedAt: now,
+          },
         },
-        { onConflict: "user_id,team_id,role_id" }
+        { upsert: true }
       );
       await writeAudit({
-        actorUserId: ctx.userId,
+        actorUserId: actor,
         action: "ASSIGN_ROLE",
-        teamId: data.id,
-        targetUserId: ctx.userId,
-        roleId: adminRole.id,
+        teamId,
+        targetUserId: actor,
+        roleId: adminRole._id,
         metadata: { reason: "auto-assigned to team creator" },
       });
     } else {
-      console.warn(
-        "No 'Admin' role found — team created without auto-assigning a role to the creator."
-      );
+      console.warn("No 'Admin' role found — team created without auto-assigning a role.");
     }
 
     await writeAudit({
-      actorUserId: ctx.userId,
+      actorUserId: actor,
       action: "CREATE_TEAM",
-      teamId: data.id,
-      metadata: { name: data.name, creatorAssignedAdmin: !!adminRole },
+      teamId,
+      metadata: { name: body.name.trim(), creatorAssignedAdmin: !!adminRole },
     });
-    return json(data, 201);
+
+    return json(
+      {
+        id: teamId.toString(),
+        name: body.name.trim(),
+        createdBy: ctx.userId,
+        createdAt: now.toISOString(),
+      },
+      201
+    );
   }
 
   return error("Method not allowed", 405);

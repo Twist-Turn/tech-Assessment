@@ -1,7 +1,7 @@
 {
   "name": "rengy-rbac",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "predev": "rm -f dist/_redirects",
@@ -10,10 +10,10 @@
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "netlify:dev": "netlify dev",
-    "seed": "tsx supabase/seed.ts"
+    "db:init": "tsx mongo/init.ts",
+    "seed": "tsx mongo/seed.ts"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.26.2",
@@ -21,10 +21,13 @@
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.5.2",
     "class-variance-authority": "^0.7.0",
-    "lucide-react": "^0.441.0"
+    "lucide-react": "^0.441.0",
+    "bcryptjs": "^2.4.3",
+    "mongodb": "^6.9.0"
   },
   "devDependencies": {
     "@netlify/functions": "^2.8.1",
+    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.5.5",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",

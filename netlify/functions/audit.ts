@@ -1,6 +1,7 @@
 import { withAuth } from "./_lib/handler.js";
 import { json, error } from "./_lib/http.js";
-import { getServiceClient } from "./_lib/supabase.js";
+import { collections, getDb } from "./_lib/db.js";
+import { tryOid } from "./_lib/serialize.js";
 import { hasAnyPermissionAnywhere } from "./_lib/permissions.js";
 
 export const handler = withAuth(async (event, ctx) => {
@@ -14,23 +15,118 @@ export const handler = withAuth(async (event, ctx) => {
   ]);
   if (!allowed) return error("Forbidden", 403);
 
-  const sb = getServiceClient();
+  const db = await getDb();
   const limit = Math.min(parseInt(event.queryStringParameters?.limit || "50", 10) || 50, 200);
-  const teamId = event.queryStringParameters?.teamId;
+  const teamId = tryOid(event.queryStringParameters?.teamId);
 
-  let q = sb
-    .from("audit_log")
-    .select(
-      "id, action, created_at, metadata, " +
-        "actor:profiles!actor_user_id ( id, name, email ), " +
-        "target:profiles!target_user_id ( id, name, email ), " +
-        "team:teams ( id, name ), role:roles ( id, name )"
-    )
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (teamId) q = q.eq("team_id", teamId);
+  const match: Record<string, unknown> = {};
+  if (teamId) match.teamId = teamId;
 
-  const { data, error: e } = await q;
-  if (e) return error(e.message, 500);
-  return json({ items: data });
+  const items = await db
+    .collection(collections.auditLog)
+    .aggregate([
+      { $match: match },
+      { $sort: { createdAt: -1 } },
+      { $limit: limit },
+      {
+        $lookup: {
+          from: collections.users,
+          localField: "actorUserId",
+          foreignField: "_id",
+          as: "actor",
+        },
+      },
+      {
+        $lookup: {
+          from: collections.users,
+          localField: "targetUserId",
+          foreignField: "_id",
+          as: "target",
+        },
+      },
+      {
+        $lookup: {
+          from: collections.teams,
+          localField: "teamId",
+          foreignField: "_id",
+          as: "team",
+        },
+      },
+      {
+        $lookup: {
+          from: collections.roles,
+          localField: "roleId",
+          foreignField: "_id",
+          as: "role",
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          id: { $toString: "$_id" },
+          action: 1,
+          created_at: "$createdAt",
+          metadata: 1,
+          actor: {
+            $let: {
+              vars: { a: { $arrayElemAt: ["$actor", 0] } },
+              in: {
+                $cond: [
+                  { $ifNull: ["$$a", false] },
+                  {
+                    id: { $toString: "$$a._id" },
+                    name: "$$a.name",
+                    email: "$$a.email",
+                  },
+                  null,
+                ],
+              },
+            },
+          },
+          target: {
+            $let: {
+              vars: { t: { $arrayElemAt: ["$target", 0] } },
+              in: {
+                $cond: [
+                  { $ifNull: ["$$t", false] },
+                  {
+                    id: { $toString: "$$t._id" },
+                    name: "$$t.name",
+                    email: "$$t.email",
+                  },
+                  null,
+                ],
+              },
+            },
+          },
+          team: {
+            $let: {
+              vars: { t: { $arrayElemAt: ["$team", 0] } },
+              in: {
+                $cond: [
+                  { $ifNull: ["$$t", false] },
+                  { id: { $toString: "$$t._id" }, name: "$$t.name" },
+                  null,
+                ],
+              },
+            },
+          },
+          role: {
+            $let: {
+              vars: { r: { $arrayElemAt: ["$role", 0] } },
+              in: {
+                $cond: [
+                  { $ifNull: ["$$r", false] },
+                  { id: { $toString: "$$r._id" }, name: "$$r.name" },
+                  null,
+                ],
+              },
+            },
+          },
+        },
+      },
+    ])
+    .toArray();
+
+  return json({ items });
 });
